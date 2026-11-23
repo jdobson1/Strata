@@ -163,6 +163,7 @@ struct ParsedGen {
     std::vector<std::string> images;
     bool prefill_only = false;
     bool slot_read = false;
+    int pin = 0;              // pin=N: the first N prompt tokens are a shared prefix (strata_prefix)
 };
 
 inline bool parse_id_list(const std::string& s, std::vector<int32_t>& out, std::string& err) {
@@ -233,6 +234,7 @@ inline bool parse_gen_cmd(const std::string& line, ParsedGen& r, std::string& er
         else if (key == "seed") r.s.seed = std::strtoull(val.c_str(), nullptr, 10);
         else if (key == "prefill") r.prefill_only = (d != 0.0);
         else if (key == "slot_read") r.slot_read = (d != 0.0);
+        else if (key == "pin") r.pin = std::max(0, static_cast<int>(d));
         else if (key == "image") r.images.push_back(pct_decode(val));
         else if (key == "hold") {
             size_t col = val.find(':');
@@ -327,6 +329,11 @@ struct ActiveReq {
     std::vector<int32_t> hist;
     std::vector<int32_t> gen_ids;
     std::vector<int32_t> cached_prefix;  // tokens currently resident in slot KV
+    // Prompt-boundary checkpoints (mirrors the backend's ring): prompt length held by each, and a
+    // monotonic recency stamp so the newest usable one is picked.
+    int ck_len[3] = {0, 0, 0};
+    long ck_seq[3] = {0, 0, 0};
+    long ck_counter = 0;
     double t_start = 0.0;
     double prompt_ms = 0.0;
     double decode_t0 = 0.0;
@@ -472,20 +479,52 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             rq.active = false;
             return false;
         }
-        // Prefix reuse check (exact prefix match with no images)
+        // Prefix reuse. Two ways to resume:
+        //  * at the prompt-boundary checkpoint (pin_ck_len): the prompt re-sends a prefix that was read
+        //    before, and the rolling ShortConv state is rewound from the snapshot taken back then.
+        //  * at the end of everything cached: the prompt continues the previous one token for token.
         int reuse = 0;
+        int reuse_idx = -1;
         if (pg.images.empty() && !rq.cached_prefix.empty()) {
-            const int lim = std::min(static_cast<int>(rq.cached_prefix.size()), rq.prompt_len - 1);
-            while (reuse < lim && rq.cached_prefix[reuse] == rq.prompt_ids[reuse]) ++reuse;
-            if (reuse != static_cast<int>(rq.cached_prefix.size())) {
-                reuse = 0;  // Safe reset when SWA/ShortConv state diverged
+            size_t lcp = 0;
+            const size_t lim0 = std::min(rq.cached_prefix.size(), static_cast<size_t>(rq.prompt_len));
+            while (lcp < lim0 && rq.cached_prefix[lcp] == rq.prompt_ids[lcp]) ++lcp;
+            // Newest checkpoint whose whole prefix still matches; a re-rendered assistant message can
+            // invalidate the newest one, so an older boundary is often the one a later request shares.
+            int best = -1;
+            for (int k = 0; k < 3; ++k) {
+                const int len = rq.ck_len[k];
+                if (len > 0 && len <= rq.prompt_len - 1 && lcp >= static_cast<size_t>(len)) {
+                    if (best < 0 || rq.ck_seq[k] > rq.ck_seq[best]) best = k;
+                }
+            }
+            if (best >= 0) {
+                reuse = rq.ck_len[best];
+                reuse_idx = best;
+            } else if (lcp == rq.cached_prefix.size() && lcp <= static_cast<size_t>(rq.prompt_len - 1)) {
+                reuse = static_cast<int>(lcp);   // prompt continues the previous one token for token
+            }
+            if (std::getenv("INK2_DEBUG_REUSE")) {
+                if (FILE* df = std::fopen("/tmp/ink2-reuse.log", "a")) {
+                    std::fprintf(df, "[ink2-reuse] slot=%d cached=%zu prompt=%d ck=%d,%d,%d lcp=%zu -> reuse=%d%s\n",
+                                 rq.slot, rq.cached_prefix.size(), rq.prompt_len,
+                                 rq.ck_len[0], rq.ck_len[1], rq.ck_len[2], lcp, reuse,
+                                 reuse_idx >= 0 ? " (pin)" : "");
+                    if (rq.cached_prefix.size() && lcp < lim0) {
+                        std::fprintf(df, "  mismatch@%zu cached=%d prompt=%d\n",
+                                     lcp, rq.cached_prefix[lcp], rq.prompt_ids[lcp]);
+                    }
+                    std::fclose(df);
+                }
             }
         }
         if (reuse == 0) {
             backend.reset_slot(rq.slot);
             rq.cached_prefix.clear();
+            for (int k = 0; k < 3; ++k) rq.ck_len[k] = 0;
         } else {
-            proto("RESUME %d", reuse);
+            if (reuse_idx >= 0) backend.restore_pin(rq.slot, reuse_idx);
+            proto("RESUME %d%s", reuse, reuse_idx >= 0 ? " pin" : "");
         }
         rq.prefill_pos = reuse;
         rq.cur_pos = reuse;
@@ -805,6 +844,15 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 for (int k = 0; k < prefill_fed[s]; ++k) rq.cached_prefix.push_back(rq.prompt_ids[rq.prefill_pos + k]);
                 rq.prefill_pos += prefill_fed[s];
                 rq.cur_pos = rq.prefill_pos;
+                // Prompt fully read: checkpoint the ShortConv state at this boundary so a later request
+                // that re-sends this prefix can resume here instead of reading it again.
+                if (rq.prefill_pos >= rq.prompt_len) {
+                    const int idx = backend.snapshot_pin(s);
+                    if (idx >= 0) {
+                        rq.ck_len[idx] = rq.prompt_len;
+                        rq.ck_seq[idx] = ++rq.ck_counter;
+                    }
+                }
                 rq.prompt_ms += step_ms;
                 if (rq.is_solo || !rq.admitted) {
                     const double ppts = step_ms > 0.0 ? (prefill_fed[s] * 1000.0 / step_ms) : 0.0;

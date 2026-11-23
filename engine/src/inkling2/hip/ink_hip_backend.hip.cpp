@@ -361,6 +361,24 @@ struct GpuSlotMeta {
     GpuBuffer sconv_rec_attn;
     GpuBuffer sconv_rec_mlp;
     int sconv_rec_n = 0;
+    // Prompt-boundary ShortConv checkpoints for prefix reuse (same layout as the snap buffers, no ring
+    // inside). Three deep: a re-rendered assistant message can diverge from the raw generation that
+    // produced it, so the newest boundary is not always the one a later request still shares.
+    struct PinCheckpoint {
+        GpuBuffer k, v, attn, mlp;
+        int seq_len = 0;
+        bool valid = false;
+        bool hot = false;   // has actually been resumed from: keep it, it is the stable shared prefix
+        void release() {
+            free_gpu_buffer(k); free_gpu_buffer(v); free_gpu_buffer(attn); free_gpu_buffer(mlp);
+            seq_len = 0; valid = false; hot = false;
+        }
+        // Invalidate without freeing. reset_slot runs between requests, and dropping the buffers there
+        // forces a free/alloc cycle that can race kernels from the previous request still in flight.
+        void clear() { seq_len = 0; valid = false; hot = false; }
+    };
+    PinCheckpoint pin_ck[3];
+    int pin_head = 0;
     // Per-slot DSpark context KV (3 layers BF16) + f_rnn (BF16), grown on demand
     GpuBuffer dspark_k[3];
     GpuBuffer dspark_v[3];
@@ -386,6 +404,8 @@ struct GpuSlotMeta {
         free_gpu_buffer(sconv_rec_v);
         free_gpu_buffer(sconv_rec_attn);
         free_gpu_buffer(sconv_rec_mlp);
+        for (auto& pc : pin_ck) pc.release();
+        pin_head = 0;
         sconv_rec_n = 0;
         for (int i = 0; i < 3; ++i) {
             free_gpu_buffer(dspark_k[i]);
@@ -909,6 +929,7 @@ public:
 
     void reset_slot(int slot) override {
         if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return;
+        hipStreamSynchronize(stream_);   // previous request's kernels must be done before state is dropped
         auto& sl = slots_[slot];
         sl.seq_len = 0;
         sl.dspark_len = 0;
@@ -920,6 +941,8 @@ public:
         sl.dspark_had_rollback = false;
         sl.tree_ema_gain = 1.25f;
         sl.tree_cool_rem = 0;
+        for (auto& pc : sl.pin_ck) pc.clear();
+        sl.pin_head = 0;
         clear_slot_sconv(slot);
     }
 
@@ -995,6 +1018,79 @@ public:
             sl.has_snap = false;
             sl.sconv_rec_n = 0;
         }
+    }
+
+    // Prefix-reuse checkpoint: copy the live ShortConv state out at the prompt boundary. Restoring it
+    // (restore_pin) rewinds the rolling conv state to pin_seq_len, which is what makes a mid-sequence
+    // resume correct -- without it the conv state would still reflect the tokens that followed.
+    // Returns the ring index the checkpoint landed in, or -1.
+    int snapshot_pin(int slot) override {
+        if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return -1;
+        hipStreamSynchronize(stream_);   // never copy state out from under an in-flight kernel
+        auto& sl = slots_[slot];
+        // Prefer a slot that has not been resumed from: a checkpoint that actually served a resume is
+        // the stable shared prefix (the document), and must survive later boundaries.
+        int idx = sl.pin_head;
+        for (int k = 0; k < 3; ++k) {
+            if (!sl.pin_ck[idx].hot) break;
+            idx = (idx + 1) % 3;
+        }
+        auto& pc = sl.pin_ck[idx];
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        const size_t kv_one = 3u * kv_dim * sizeof(uint16_t);
+        const size_t h_one  = 3u * c_.hidden * sizeof(uint16_t);
+        if (!pc.k.dev_ptr) {
+            hip_ign(alloc_gpu_buffer(pc.k, static_cast<size_t>(c_.n_visits) * kv_one, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(pc.v, static_cast<size_t>(c_.n_visits) * kv_one, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(pc.attn, static_cast<size_t>(c_.n_visits) * h_one, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(pc.mlp, static_cast<size_t>(c_.n_visits) * h_one, mem_info_.is_uma));
+        }
+        k_sconv_snapshot_pair<<<dim3((kv_dim + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(d_sconv_k_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_sconv_v_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(pc.k.dev_ptr),
+            reinterpret_cast<uint16_t*>(pc.v.dev_ptr),
+            slot, max_slots_, c_.n_visits, kv_dim);
+        k_sconv_snapshot_pair<<<dim3((c_.hidden + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(d_sconv_attn_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_sconv_mlp_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(pc.attn.dev_ptr),
+            reinterpret_cast<uint16_t*>(pc.mlp.dev_ptr),
+            slot, max_slots_, c_.n_visits, c_.hidden);
+        pc.seq_len = sl.seq_len;
+        pc.valid = true;
+        sl.pin_head = (idx + 1) % 3;
+        return idx;
+    }
+
+    void restore_pin(int slot, int idx) override {
+        if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return;
+        if (idx < 0 || idx >= 3) return;
+        hipStreamSynchronize(stream_);   // the snapshot must be complete before it is read back
+        auto& sl = slots_[slot];
+        auto& pc = sl.pin_ck[idx];
+        if (!pc.valid) return;
+        pc.hot = true;   // served a resume: keep this boundary from being evicted
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        // keep_steps = 0: every tap reads the snapshot, so this is a straight restore of the boundary state.
+        k_sconv_rollback_pair<<<dim3((kv_dim + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(pc.k.dev_ptr),
+            reinterpret_cast<const uint16_t*>(pc.k.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_k_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(pc.v.dev_ptr),
+            reinterpret_cast<const uint16_t*>(pc.v.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_v_all_.dev_ptr),
+            slot, max_slots_, c_.n_visits, 0, kv_dim);
+        k_sconv_rollback_pair<<<dim3((c_.hidden + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(pc.attn.dev_ptr),
+            reinterpret_cast<const uint16_t*>(pc.attn.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(pc.mlp.dev_ptr),
+            reinterpret_cast<const uint16_t*>(pc.mlp.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_mlp_all_.dev_ptr),
+            slot, max_slots_, c_.n_visits, 0, c_.hidden);
+        sl.seq_len = pc.seq_len;
+        sl.dspark_len = std::min(sl.dspark_len, pc.seq_len);
     }
 
     bool forward_batch(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) override {
@@ -3172,7 +3268,9 @@ private:
                     k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
                 }
                 if (mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
-                    if (B >= 64) {
+                    // RDNA4 (gfx120x) is excluded: the _128 grouped-MoE WMMA path (m_tiles fan-out)
+                    // returns NaN there. The small-B kernels below are correct at any B.
+                    if (B >= 64 && mem_info_.gen != AmdGen::Rdna4) {
                         // Wave-5 BM=128, BN=128 Grouped-MoE with m_tiles=8 hot-expert fan-out!
                         // Cold/avg experts (m_e <= 128) exit z>=1 on instruction #1 -> 1.0x W reads;
                         // Hot Zipfian experts (m_e=500..1000) fan out across 8 parallel CTAs sharing W in L2/MALL (ZERO tail stragglers!)

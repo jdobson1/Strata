@@ -63,6 +63,13 @@ public:
     virtual void snapshot_slot(int slot) = 0;
     virtual void rollback_slot(int slot, int keep_len) = 0;
 
+    // Prompt-boundary checkpoints for prefix reuse: snapshot a slot's ShortConv state the moment its
+    // prompt has been fully read, so a later request that shares that prefix can resume there without
+    // re-reading it. `snapshot_pin` returns the ring index used (-1 = unsupported), `restore_pin`
+    // rewinds to that checkpoint. No-op on backends without a rolling conv state.
+    virtual int snapshot_pin(int slot) { (void)slot; return -1; }
+    virtual void restore_pin(int slot, int idx) { (void)slot; (void)idx; }
+
     // Batched 48-visit forward across 1..64 active slots!
     // logits_out: [batch.count_logits(), vocab_unpadded] FP32 (already softcapped by 30*tanh(z/30) and sliced to 200058).
     virtual bool forward_batch(
