@@ -436,6 +436,16 @@ struct GpuSlotMeta {
     GpuBuffer sconv_rec_attn;
     GpuBuffer sconv_rec_mlp;
     int sconv_rec_n = 0;
+    // Prompt-end conversation checkpoint (#6627, HIP implementation). Snapshots the rolling ShortConv
+    // state at `ckpt_seq_len`; the SWA/global KV pages for positions < ckpt_seq_len are left in place
+    // because only a later prefill overwrites them, and reset_slot invalidates this checkpoint.
+    GpuBuffer ckpt_k;
+    GpuBuffer ckpt_v;
+    GpuBuffer ckpt_attn;
+    GpuBuffer ckpt_mlp;
+    int ckpt_seq_len = 0;
+    int ckpt_dspark_len = 0;
+    bool ckpt_valid = false;
     // Per-slot DSpark context KV (3 layers BF16) + f_rnn (BF16), grown on demand
     GpuBuffer dspark_k[3];
     GpuBuffer dspark_v[3];
@@ -461,7 +471,14 @@ struct GpuSlotMeta {
         free_gpu_buffer(sconv_rec_v);
         free_gpu_buffer(sconv_rec_attn);
         free_gpu_buffer(sconv_rec_mlp);
+        free_gpu_buffer(ckpt_k);
+        free_gpu_buffer(ckpt_v);
+        free_gpu_buffer(ckpt_attn);
+        free_gpu_buffer(ckpt_mlp);
         sconv_rec_n = 0;
+        ckpt_seq_len = 0;
+        ckpt_dspark_len = 0;
+        ckpt_valid = false;
         for (int i = 0; i < 3; ++i) {
             free_gpu_buffer(dspark_k[i]);
             free_gpu_buffer(dspark_v[i]);
@@ -1430,6 +1447,7 @@ public:
         sl.dspark_had_rollback = false;
         sl.tree_ema_gain = 1.25f;
         sl.tree_cool_rem = 0;
+        sl.ckpt_valid = false;   // KV pages for the old prefix are about to be overwritten
         clear_slot_sconv(slot);
     }
 
@@ -1505,6 +1523,69 @@ public:
             sl.has_snap = false;
             sl.sconv_rec_n = 0;
         }
+    }
+
+    // Prompt-end conversation checkpoint (#6627). Save the rolling ShortConv state at `seq_len` so a
+    // later request that re-sends this prompt prefix can resume there. Mirrors the CPU backend's
+    // save/restore_prompt_checkpoint, plus the stream syncs the async HIP path needs.
+    bool save_prompt_checkpoint(int slot, int seq_len) override {
+        if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated || seq_len <= 0) return false;
+        hipStreamSynchronize(stream_);   // never copy state out from under an in-flight kernel
+        auto& sl = slots_[slot];
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        const size_t kv_one = 3u * kv_dim * sizeof(uint16_t);
+        const size_t h_one  = 3u * c_.hidden * sizeof(uint16_t);
+        if (!sl.ckpt_k.dev_ptr) {
+            hip_ign(alloc_gpu_buffer(sl.ckpt_k, static_cast<size_t>(c_.n_visits) * kv_one, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(sl.ckpt_v, static_cast<size_t>(c_.n_visits) * kv_one, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(sl.ckpt_attn, static_cast<size_t>(c_.n_visits) * h_one, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(sl.ckpt_mlp, static_cast<size_t>(c_.n_visits) * h_one, mem_info_.is_uma));
+        }
+        k_sconv_snapshot_pair<<<dim3((kv_dim + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(d_sconv_k_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_sconv_v_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.ckpt_k.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.ckpt_v.dev_ptr),
+            slot, max_slots_, c_.n_visits, kv_dim);
+        k_sconv_snapshot_pair<<<dim3((c_.hidden + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(d_sconv_attn_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_sconv_mlp_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.ckpt_attn.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.ckpt_mlp.dev_ptr),
+            slot, max_slots_, c_.n_visits, c_.hidden);
+        sl.ckpt_seq_len = seq_len;
+        sl.ckpt_dspark_len = sl.dspark_len;
+        sl.ckpt_valid = true;
+        return true;
+    }
+
+    bool restore_prompt_checkpoint(int slot, int seq_len) override {
+        if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return false;
+        auto& sl = slots_[slot];
+        if (!sl.ckpt_valid || sl.ckpt_seq_len != seq_len) return false;
+        hipStreamSynchronize(stream_);   // the snapshot must be complete before it is read back
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        // keep_steps = 0: every tap reads the snapshot, so this is a straight restore of that state.
+        k_sconv_rollback_pair<<<dim3((kv_dim + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(sl.ckpt_k.dev_ptr),
+            reinterpret_cast<const uint16_t*>(sl.ckpt_k.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_k_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(sl.ckpt_v.dev_ptr),
+            reinterpret_cast<const uint16_t*>(sl.ckpt_v.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_v_all_.dev_ptr),
+            slot, max_slots_, c_.n_visits, 0, kv_dim);
+        k_sconv_rollback_pair<<<dim3((c_.hidden + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(sl.ckpt_attn.dev_ptr),
+            reinterpret_cast<const uint16_t*>(sl.ckpt_attn.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(sl.ckpt_mlp.dev_ptr),
+            reinterpret_cast<const uint16_t*>(sl.ckpt_mlp.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_mlp_all_.dev_ptr),
+            slot, max_slots_, c_.n_visits, 0, c_.hidden);
+        sl.seq_len = seq_len;
+        sl.dspark_len = std::min(sl.ckpt_dspark_len, seq_len);
+        sl.has_snap = false;
+        return true;
     }
 
     bool forward_batch(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) override {
@@ -3958,7 +4039,9 @@ private:
                     k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
                 }
                 if (mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
-                    if (B >= 64) {
+                    // RDNA4 (gfx120x) is excluded: the _128 grouped-MoE WMMA path (m_tiles fan-out)
+                    // returns NaN there. The small-B kernels below are correct at any B.
+                    if (B >= 64 && mem_info_.gen != AmdGen::Rdna4) {
                         // Wave-5 BM=128, BN=128 Grouped-MoE with m_tiles=8 hot-expert fan-out!
                         // Cold/avg experts (m_e <= 128) exit z>=1 on instruction #1 -> 1.0x W reads;
                         // Hot Zipfian experts (m_e=500..1000) fan out across 8 parallel CTAs sharing W in L2/MALL (ZERO tail stragglers!)
